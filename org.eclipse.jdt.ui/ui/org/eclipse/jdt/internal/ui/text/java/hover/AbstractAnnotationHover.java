@@ -26,6 +26,7 @@ import org.eclipse.swt.events.KeyEvent;
 import org.eclipse.swt.events.KeyListener;
 import org.eclipse.swt.events.MouseEvent;
 import org.eclipse.swt.events.MouseListener;
+import org.eclipse.swt.events.MouseTrackAdapter;
 import org.eclipse.swt.events.SelectionAdapter;
 import org.eclipse.swt.events.SelectionEvent;
 import org.eclipse.swt.graphics.Color;
@@ -38,6 +39,7 @@ import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Canvas;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Control;
+import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.Link;
 import org.eclipse.swt.widgets.ScrollBar;
@@ -53,6 +55,7 @@ import org.eclipse.core.filebuffers.LocationKind;
 
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.action.ToolBarManager;
+import org.eclipse.jface.internal.text.html.BrowserInformationControl;
 import org.eclipse.jface.preference.IPreferenceStore;
 import org.eclipse.jface.preference.JFacePreferences;
 import org.eclipse.jface.resource.ColorRegistry;
@@ -74,6 +77,7 @@ import org.eclipse.jface.text.Position;
 import org.eclipse.jface.text.contentassist.ICompletionProposal;
 import org.eclipse.jface.text.contentassist.ICompletionProposalExtension;
 import org.eclipse.jface.text.contentassist.ICompletionProposalExtension2;
+import org.eclipse.jface.text.contentassist.IContextInformation;
 import org.eclipse.jface.text.source.Annotation;
 import org.eclipse.jface.text.source.IAnnotationModel;
 import org.eclipse.jface.text.source.IAnnotationModelExtension2;
@@ -88,12 +92,18 @@ import org.eclipse.ui.texteditor.DefaultMarkerAnnotationAccess;
 
 import org.eclipse.ui.editors.text.EditorsUI;
 
+import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.JavaModelException;
+
 import org.eclipse.jdt.internal.corext.util.Messages;
 
 import org.eclipse.jdt.internal.ui.JavaPlugin;
 import org.eclipse.jdt.internal.ui.JavaPluginImages;
+import org.eclipse.jdt.internal.ui.javaeditor.IJavaAnnotation;
 import org.eclipse.jdt.internal.ui.javaeditor.JavaAnnotationIterator;
 import org.eclipse.jdt.internal.ui.text.correction.proposals.FixCorrectionProposal;
+import org.eclipse.jdt.internal.ui.text.javadoc.JavadocContentAccess2;
 
 
 /**
@@ -155,6 +165,7 @@ public abstract class AbstractAnnotationHover extends AbstractJavaEditorTextHove
 		private Control fFocusControl;
 		private AnnotationInfo fInput;
 		private Composite fParent;
+		protected Rectangle mainBounds;
 
 		public AnnotationInformationControl(Shell parentShell, String statusFieldText) {
 			super(parentShell, statusFieldText);
@@ -301,10 +312,150 @@ public abstract class AbstractAnnotationHover extends AbstractJavaEditorTextHove
 			setColorAndFont(fParent, foreground, background, JFaceResources.getDialogFont()); // For child elements.
 
 			ICompletionProposal[] proposals= getAnnotationInfo().getCompletionProposals();
+
+			// Try adding javadoc proposal if possible.
+			ICompletionProposal javadocProposal= createJavadocProposal();
+
+			if (javadocProposal != null) {
+				ICompletionProposal[] temp = new ICompletionProposal[proposals.length + 1];
+				temp[0] = javadocProposal;
+				System.arraycopy(proposals, 0, temp, 1, proposals.length);
+				proposals = temp;
+			}
+
 			if (proposals.length > 0)
 				createCompletionProposalsControl(fParent, proposals);
 
 			fParent.layout(true);
+
+			// quickfix hover bounds backup.
+				Shell shell = getShell();
+				if (shell != null && !shell.isDisposed()) {
+					shell.addMouseTrackListener(new MouseTrackAdapter() {
+						@Override
+						public void mouseEnter(MouseEvent e) {
+							mainBounds = shell.getBounds();
+						}
+					});
+				}
+		}
+
+		private ICompletionProposal createJavadocProposal() {
+			IJavaElement javaElement= null;
+			Annotation annotation= getAnnotationInfo().annotation;
+			if (annotation instanceof IJavaAnnotation) {
+				ICompilationUnit cu= ((IJavaAnnotation) annotation).getCompilationUnit();
+				if (cu != null) {
+					try {
+						int offset= getAnnotationInfo().position.getOffset();
+						IJavaElement[] elements= cu.codeSelect(offset, 0);
+						if (elements != null && elements.length > 0) {
+							javaElement= elements[0];
+						}
+					} catch (JavaModelException e) {
+						JavaPlugin.log(e.getStatus());
+					}
+				}
+			}
+
+			if (javaElement == null)
+				return null;
+
+			ICompletionProposal javadocProposal= null;
+			try {
+				String javadocHtml= JavadocContentAccess2.getHTMLContent(javaElement, true);
+				if (javadocHtml != null && !javadocHtml.isEmpty()) {
+					final IJavaElement elementForProposal= javaElement;
+					final String javadocHtmlForProposal= javadocHtml;
+					javadocProposal= new ICompletionProposal() {
+
+						@Override
+						public void apply(IDocument document) {
+
+							Display.getDefault().asyncExec(new Runnable() {
+								@Override
+								public void run() {
+									JavadocBrowserInformationControlInput infoInput= new JavadocBrowserInformationControlInput(null, elementForProposal, javadocHtmlForProposal, 0);
+									org.eclipse.jface.text.IInformationControlCreator presenterCreator= new JavadocHover.PresenterControlCreator(null);
+
+									Shell shell= JavaPlugin.getActiveWorkbenchShell();
+									if (shell == null) {
+										shell= Display.getDefault().getActiveShell();
+									}
+									if (shell == null)
+										return;
+
+									IInformationControl javaDocControl= presenterCreator.createInformationControl(shell);
+									if (javaDocControl == null)
+										return;
+
+									if (javaDocControl instanceof BrowserInformationControl) {
+										((BrowserInformationControl) javaDocControl).setInput(infoInput);
+									}
+									javaDocControl.addFocusListener(new FocusListener() {
+										@Override
+										public void focusLost(FocusEvent e) {
+											javaDocControl.dispose();
+										}
+
+										@Override
+										public void focusGained(FocusEvent e) {
+											// do nothing
+										}
+									});
+
+
+									Point pref= javaDocControl.computeSizeHint();
+
+									int x= mainBounds.x;
+									int y= mainBounds.y;
+
+									Rectangle clientArea= shell.getDisplay().getClientArea();
+
+									if (x + pref.x > clientArea.x + clientArea.width) {
+										x= Math.max(clientArea.x, pref.x);
+									}
+									if (y + pref.y > clientArea.y + clientArea.height) {
+										y= Math.max(clientArea.y, clientArea.y + clientArea.height - pref.y);
+									}
+									javaDocControl.setLocation(new Point(x, y));
+									javaDocControl.setSize(pref.x, pref.y);
+									javaDocControl.setVisible(true);
+									javaDocControl.setFocus();
+								}
+							});
+						}
+
+						@Override
+						public Point getSelection(IDocument document) {
+							return null;
+						}
+
+						@Override
+						public String getAdditionalProposalInfo() {
+							return null;
+						}
+
+						@Override
+						public String getDisplayString() {
+							return JavaHoverMessages.JavaTextHover_Javadoc_Proposal;
+						}
+
+						@Override
+						public Image getImage() {
+							return JavaPluginImages.DESC_OBJS_JAVADOC_LOCATION_ATTRIB.createImage();
+						}
+
+						@Override
+						public IContextInformation getContextInformation() {
+							return null;
+						}
+					};
+				}
+			} catch (CoreException e) {
+				JavaPlugin.log(e);
+			}
+			return javadocProposal;
 		}
 
 		private void setColorAndFont(Control control, Color foreground, Color background, Font font) {
